@@ -1,1 +1,51 @@
+name: 同步上游 KuGouMusicApi
 
+on:
+  schedule:
+    # 每天 UTC 01:00 = 北京时间 09:00
+    - cron: '0 1 * * *'
+  workflow_dispatch:   # 也可以在 Actions 页面点 "Run workflow" 手动跑一次
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出你的仓库
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          # 有 SYNC_TOKEN 就用它（用它推送可以触发后续部署工作流），没有就用自带的 GITHUB_TOKEN
+          token: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: 添加上游仓库
+        run: |
+          git remote add upstream https://github.com/MakcRe/KuGouMusicApi.git
+          git fetch upstream main
+
+      - name: 合并上游
+        id: merge
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "已是最新，无需合并"
+            echo "changed=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          if ! git merge upstream/main --no-edit -m "chore: sync upstream $(date -u +%Y-%m-%dT%H:%M:%SZ)"; then
+            echo "::error::合并冲突，需要手动处理"
+            git merge --abort || true
+            exit 1
+          fi
+
+          echo "changed=true" >> $GITHUB_OUTPUT
+
+      - name: 推送到你的 main
+        if: steps.merge.outputs.changed == 'true'
+        run: git push origin HEAD:main
