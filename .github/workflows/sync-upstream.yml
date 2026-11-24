@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       reset:
-        description: '首次对齐：用上游强制覆盖我的 main（会丢弃本地改动）'
+        description: '首次对齐：用上游强制覆盖我的 main（会丢弃本地改动，但 .github/workflows 仍保留本地版本）'
         type: boolean
         default: false
 
@@ -27,7 +27,7 @@ jobs:
 
       - name: 添加上游仓库
         run: |
-          git remote add upstream https://github.com/MakcRe/KuGouMusicApi.git
+          git remote add upstream https://github.com/MakcRe/KuGouMusicApi.git 2>/dev/null || true
           git fetch upstream main
 
       - name: 合并上游
@@ -36,31 +36,56 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           echo "changed=false" >> $GITHUB_OUTPUT
+          echo "force=false"   >> $GITHUB_OUTPUT
 
-          # 首次对齐：把本地 main 直接指向上游，历史从此一致
+          # 记下合并前的本地提交，后面用它还原 .github/workflows
+          BASE=$(git rev-parse HEAD)
+          FORCE=false
+
           if [ "${{ inputs.reset }}" = "true" ]; then
+            # 首次对齐：把本地 main 直接指向上游，历史从此一致
             git reset --hard upstream/main
-            echo "changed=true"    >> $GITHUB_OUTPUT
-            echo "force=true"      >> $GITHUB_OUTPUT
-            echo "已对齐到上游 $(git rev-parse --short upstream/main)"
-            exit 0
+            FORCE=true
+          else
+            if git merge-base --is-ancestor upstream/main HEAD; then
+              echo "已是最新，无需合并"
+              exit 0
+            fi
+
+            # --allow-unrelated-histories：兼容"上传文件"方式建的仓库
+            # -X theirs：同名文件有差异时以上游为准，避免每天卡在冲突
+            if ! git merge --allow-unrelated-histories -X theirs upstream/main --no-edit \
+                 -m "chore: sync upstream $(date -u +%Y-%m-%dT%H:%M:%SZ)"; then
+              echo "::error::合并失败，请查看上面的 git 输出"
+              git merge --abort || true
+              exit 1
+            fi
           fi
 
-          if git merge-base --is-ancestor upstream/main HEAD; then
-            echo "已是最新，无需合并"
-            exit 0
+          # ===== 关键改动：.github/workflows 永远用本地版本，不跟随上游 =====
+          # 先整目录删掉（含上游新增的 workflow 文件），再从合并前的提交里取回自己的
+          if git rev-parse --verify -q "$BASE:.github/workflows" >/dev/null; then
+            git rm -rf --ignore-unmatch .github/workflows >/dev/null 2>&1 || true
+            git checkout "$BASE" -- .github/workflows
+          else
+            echo "::warning::本地 main 中没有 .github/workflows，跳过还原"
           fi
+          git add -A
 
-          # --allow-unrelated-histories：兼容"上传文件"方式建的仓库
-          # -X theirs：同名文件有差异时以上游为准，避免每天卡在冲突
-          if ! git merge --allow-unrelated-histories -X theirs upstream/main --no-edit \
-               -m "chore: sync upstream $(date -u +%Y-%m-%dT%H:%M:%SZ)"; then
-            echo "::error::合并失败，请查看上面的 git 输出"
-            git merge --abort || true
-            exit 1
+          if git diff --cached --quiet; then
+            echo "工作流目录与本地一致，无需额外提交"
+          else
+            if [ "$FORCE" = "false" ]; then
+              # merge 场景：把还原内容揉进这个合并提交，
+              # 这样推上去的提交在 workflow 文件上没有净变更，GITHUB_TOKEN 也不会被拦
+              git commit --amend --no-edit
+            else
+              git commit -m "chore: 保留本地 workflows（不同步 .github/workflows）"
+            fi
           fi
 
           echo "changed=true" >> $GITHUB_OUTPUT
+          echo "force=$FORCE"  >> $GITHUB_OUTPUT
 
       - name: 推送到你的 main
         if: steps.merge.outputs.changed == 'true'
